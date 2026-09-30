@@ -301,11 +301,20 @@ public final class TendiesEngine {
 
             for (descIndex, descItem) in descriptors.enumerated() {
                 let targetUUID = UUID().uuidString.uppercased()
-                let randomizedID = Int.random(in: 10000...99999)
-                log("  [\(descIndex + 1)/\(descriptors.count)] Descriptor \(targetUUID) (ID: \(randomizedID)) for \(descItem.ext)…")
 
-                // Update plist identifiers to ensure unique indexing without collisions
-                updatePlistIdentifiers(in: descItem.url, randomizedID: randomizedID)
+                // Numeric identifiers (Collections-style) are randomized to avoid collisions.
+                // Named identifiers such as Mercury's "v6x.colorB" are looked up by the poster
+                // extension and must be kept, otherwise PosterBoard drops the descriptor.
+                let existingID = descriptorIdentifier(in: descItem.url)
+                if let existingID, Int(existingID) == nil {
+                    log("  [\(descIndex + 1)/\(descriptors.count)] Descriptor \(targetUUID) (ID: \(existingID), preserved) for \(descItem.ext)…")
+                } else {
+                    let randomizedID = Int.random(in: 10000...99999)
+                    log("  [\(descIndex + 1)/\(descriptors.count)] Descriptor \(targetUUID) (ID: \(randomizedID)) for \(descItem.ext)…")
+
+                    // Update plist identifiers to ensure unique indexing without collisions
+                    updatePlistIdentifiers(in: descItem.url, randomizedID: randomizedID)
+                }
 
                 for sVer in versionsToWrite {
                     // Primary destination
@@ -478,6 +487,14 @@ public final class TendiesEngine {
 
     // MARK: - Plist Identifier Randomization (Matches Nugget implementation)
 
+    private func descriptorIdentifier(in folderURL: URL) -> String? {
+        let idURL = folderURL.appendingPathComponent("com.apple.posterkit.provider.descriptor.identifier")
+        guard let data = try? Data(contentsOf: idURL),
+              let value = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
     private func updatePlistIdentifiers(in folderURL: URL, randomizedID: Int) {
         let fileManager = FileManager.default
         guard let enumerator = fileManager.enumerator(
@@ -571,22 +588,18 @@ public final class TendiesEngine {
         let fileManager = FileManager.default
         var results: [(ext: String, url: URL)] = []
 
-        // 1. Check for standard container structure
-        let containerFolder = rootURL.appendingPathComponent("container")
-        let searchRoots = fileManager.fileExists(atPath: containerFolder.path) ? [containerFolder, rootURL] : [rootURL]
-
-        for sRoot in searchRoots {
-            let extensionsDir = sRoot.appendingPathComponent("Library/Application Support/PRBPosterExtensionDataStore/61/Extensions")
-            if fileManager.fileExists(atPath: extensionsDir.path) {
-                if let extEntries = try? fileManager.contentsOfDirectory(at: extensionsDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
-                    for extFolder in extEntries {
-                        let descDir = extFolder.appendingPathComponent("descriptors")
-                        if fileManager.fileExists(atPath: descDir.path),
-                           let descEntries = try? fileManager.contentsOfDirectory(at: descDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
-                            for d in descEntries where (try? d.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false {
-                                if !d.lastPathComponent.hasPrefix(".") && d.lastPathComponent != "__MACOSX" {
-                                    results.append((ext: extFolder.lastPathComponent, url: d))
-                                }
+        // 1. Check for standard container structure. Archives may wrap it in an extra
+        // top-level folder (e.g. "iPhone 18 Pro/Container/...") and the iOS filesystem is
+        // case-sensitive, so search for PRBPosterExtensionDataStore/<ver>/Extensions at any depth.
+        for extensionsDir in findPosterExtensionsDirectories(in: rootURL) {
+            if let extEntries = try? fileManager.contentsOfDirectory(at: extensionsDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+                for extFolder in extEntries {
+                    let descDir = extFolder.appendingPathComponent("descriptors")
+                    if fileManager.fileExists(atPath: descDir.path),
+                       let descEntries = try? fileManager.contentsOfDirectory(at: descDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+                        for d in descEntries where (try? d.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false {
+                            if !d.lastPathComponent.hasPrefix(".") && d.lastPathComponent != "__MACOSX" {
+                                results.append((ext: extFolder.lastPathComponent, url: d))
                             }
                         }
                     }
@@ -650,5 +663,32 @@ public final class TendiesEngine {
         }
 
         return results.isEmpty ? [(ext: defaultExt, url: rootURL)] : results
+    }
+
+    /// Finds every `PRBPosterExtensionDataStore/<version>/Extensions` directory below `rootURL`,
+    /// regardless of wrapper folders or the casing of the `container` folder.
+    private func findPosterExtensionsDirectories(in rootURL: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var results: [URL] = []
+        while let itemURL = enumerator.nextObject() as? URL {
+            guard (try? itemURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false else { continue }
+            if itemURL.lastPathComponent == "__MACOSX" {
+                enumerator.skipDescendants()
+                continue
+            }
+            let versionDir = itemURL.deletingLastPathComponent()
+            if itemURL.lastPathComponent == "Extensions",
+               Int(versionDir.lastPathComponent) != nil,
+               versionDir.deletingLastPathComponent().lastPathComponent == "PRBPosterExtensionDataStore" {
+                results.append(itemURL)
+                enumerator.skipDescendants()
+            }
+        }
+        return results
     }
 }
